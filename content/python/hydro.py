@@ -132,17 +132,20 @@ class GR4J:
         return [q]
 
 
-def calibration(x, in_obs, out_obs, warmup_period, crit_func, model, x_range, x_fix=None):
-    _x = []
-    for i in range(len(x_range)):
-        if x_fix is None or x_fix[i] is None:
-            if x[i] < x_range[i][0]:
-                return np.inf
-            if x[i] > x_range[i][1]:
-                return np.inf
-            _x.append(x[i])
-        else:
-            _x.append(x_fix[i])
+def calibration(x, in_obs, out_obs, warmup_period, crit_func, model, x_range=None, x_fix=None):
+    if x_range is None:
+        _x = x
+    else:
+        _x = []
+        for i in range(len(x_range)):
+            if x_fix is None or x_fix[i] is None:
+                if x[i] < x_range[i][0]:
+                    return np.inf
+                if x[i] > x_range[i][1]:
+                    return np.inf
+                _x.append(x[i])
+            else:
+                _x.append(x_fix[i])
     q_mod = model(_x)
     out_sim = q_mod.run(in_obs)
     error = crit_func(out_obs[0][warmup_period:], out_sim[0][warmup_period:])
@@ -157,3 +160,160 @@ def nse(x_obs, x_est):
 
 def nse_min(x_obs, x_est):
     return 1. - nse(x_obs, x_est)
+
+
+# original code at: https://github.com/olivierverdier/downhill-simplex/blob/19c2c5b25ee6c7ae5bb231e90db168e389dbe8b8/downhill_simplex.py
+
+def generate_simplex(x0, step=0.1):
+    """
+    Create a simplex based at x0
+    """
+    yield x0.copy()
+    for i,_ in enumerate(x0):
+        x = x0.copy()
+        x[i] += step
+        yield x
+
+def make_simplex(x0, step=0.1):
+    return np.array(list(generate_simplex(x0, step)))
+
+def centroid(points):
+    """
+    Compute the centroid of a list points given as an array.
+    """
+    return np.mean(points, axis=0)
+
+
+class DownhillSimplex(object):
+
+    refl = 1.
+    ext = 1.
+    cont = 0.5
+    red = 0.5
+
+    # max_stagnations: break after max_stagnations iterations with an improvement lower than no_improv_thr
+    no_improve_thr=10e-6
+    max_stagnations=10
+
+    max_iter=1000
+    
+    def __init__(self, f, points):
+        '''
+            f: (function): function to optimize, must return a scalar score 
+                and operate over a numpy array of the same dimensions as x_start
+            points: (numpy array): initial position
+        '''
+        self.f = f
+        self.points = points
+
+    def step(self, res):
+        # centroid of the lowest face
+        pts = np.array([tup[0] for tup in res[:-1]])
+        x0 = centroid(pts)
+
+        new_res = self.reflection(res, x0, self.refl)
+        if new_res is not None:
+            exp_res = self.expansion(new_res, x0, self.ext)
+            if exp_res is not None:
+                new_res = exp_res
+        else:
+            new_res = self.contraction(res, x0, self.cont)
+            if new_res is None:
+                new_res = self.reduction(res, self.red)
+        return new_res
+
+    def run(self):
+        # initialize
+        self.prev_best = self.f(self.points[0])
+        self.stagnations = 0
+        res = self.make_score(self.points)
+
+        # simplex iter
+        for iters in range(self.max_iter):
+            res = self.sort(res)
+            best = res[0][1]
+
+            # break after max_stagnations iterations with no improvement
+            if best < self.prev_best - self.no_improve_thr:
+                self.stagnations = 0
+                self.prev_best = best
+            else:
+                self.stagnations += 1
+        
+            if self.stagnations >= self.max_stagnations:
+                return res[0]
+
+            # Downhill-Simplex algorithm
+            new_res = self.step(res)
+
+            res = new_res
+        else:
+            raise Exception("No convergence after {} iterations".format(iters))
+
+
+    def sort(self, res):
+        """
+        Order the points according to their value.
+        """
+        return sorted(res, key = lambda x: x[1])
+
+    def reflection(self, res, x0, refl):
+        """
+        Reflection-extension step.
+        refl: refl = 1 is a standard reflection
+        """
+        # reflected point and score
+        xr = x0 + refl*(x0 - res[-1][0])
+        rscore = self.f(xr)
+
+        new_res = res[:]
+
+        progress = rscore < new_res[-2][1]
+        if progress: # if this is a progress, we keep it
+            new_res[-1] = (xr, rscore)
+            return new_res
+        return None
+
+    def expansion(self, res, x0, ext):
+        """
+        ext: the amount of the expansion; ext=0 means no expansion
+        """
+        xr, rscore = res[-1]
+        # if it is the new best point, we try to expand
+        if rscore < res[0][1]:
+            xe = xr + ext*(xr - x0)
+            escore = self.f(xe)
+            if escore < rscore:
+                new_res = res[:]
+                new_res[-1] = (xe, escore)
+                return new_res
+        return None
+
+    def contraction(self, res, x0, cont):
+        """
+        cont: contraction parameter: should be between zero and one
+        """
+        xc = x0 + cont*(res[-1][0] - x0)
+        cscore = self.f(xc)
+
+        new_res = res[:]
+
+        progress = cscore < new_res[-1][1]
+        if progress:
+            new_res[-1] = (xc, cscore)
+            return new_res
+        return None
+
+    def reduction(self, res, red):
+        """
+        red: reduction parameter: should be between zero and one
+        """
+        pts = np.array([pts for (pts,_) in res])
+        dirs = pts - pts[0]
+        reduced_points = pts[0] + red*dirs
+        new_res = self.make_score(reduced_points)
+        return new_res
+
+    def make_score(self, points):
+        res = [(pt, self.f(pt)) for pt in points]
+        return res
